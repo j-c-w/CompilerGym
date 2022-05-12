@@ -36,29 +36,25 @@ class RuntimeReward(Reward):
 
     def __init__(self):
         super().__init__(
-            name="runtime",
-            observation_spaces=["runtime"],
+            name="II",
+            observation_spaces=["II"],
             default_value=0,
             default_negates_returns=True,
-            deterministic=False,
+            deterministic=True,
             platform_dependent=True,
         )
-        self.previous_runtime = None
+        pass
 
     def reset(self, benchmark: str, observation_view):
         del benchmark  # unused
-        self.previous_runtime = None
 
     def update(self, action, observations, observation_view):
         del action
         del observation_view
 
-        if self.previous_runtime is None:
-            self.previous_runtime = observations[0]
-
-        reward = float(self.previous_runtime - observations[0])
-        self.previous_runtime = observations[0]
-        return reward
+        print("Computing Reward: got II of ", observations[0])
+        # Add a constant negative reward for not figuring it out?
+        return -float(observations[0]) - 0.1
 
 
 class ExampleDataset(Dataset):
@@ -115,11 +111,14 @@ def main():
             print("Starting Iteration " + str(iteration))
             print ("Action is:")
             print(action)
-            observation, reward, done, info = env.step(action, observation_spaces=["ir", "CurrentInstruction", "CurrentInstructionIndex"])
+            observation, reward, done, info = env.step(action, observation_spaces=["ir", "CurrentInstruction", "CurrentInstructionIndex", "II"], reward_spaces=["II"])
             print ("Got observation")
             print (observation)
+            print ("Got reward")
+            print (reward)
             if done:
                 env.reset()
+                print ("Overall reward is ", reward)
             iteration += 1
 
 

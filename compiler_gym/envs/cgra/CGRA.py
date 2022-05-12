@@ -19,7 +19,7 @@ StringSpace
 )
 import compiler_gym.third_party.llvm as llvm
 from compiler_gym.third_party.inst2vec import Inst2vecEncoder
-from DFG import DFG
+import DFG
 
 from compiler_gym.service.proto.compiler_gym_service_pb2 import Int64SequenceSpace
 #from compiler_gym.service.runtime import create_and_run_compiler_gym_service
@@ -97,41 +97,126 @@ class CGRA(object):
         # Assume one hop per cell right now.
         return self.distance(index_1, index_2)
 
-class Schedule(object):
+# This is just a wrapper around an actual object that
+# is a schedule --- see the Schedule object for something
+# that can be interacted with.
+class InternalSchedule(object):
     def __init__(self, cgra):
         self.cgra = cgra
+        self.operations = self.initialize_schedule()
 
-        self.operations = []
-        for x in range(cgra.x_dim):
+    def locations(self):
+        for x in range(self.cgra.x_dim):
+            for y in range(self.cgra.y_dim):
+                yield x, y
+
+    def add_timestep(self):
+        ops = []
+        for x in range(self.cgra.x_dim):
             arr = []
-            for y in range(cgra.y_dim):
+            for y in range(self.cgra.y_dim):
                 arr.append(None)
-            self.operations.append(arr)
+            ops.append(arr)
+        return ops
 
-    def set_operation(self, index, node):
-        x, y = self.cgra.get_coords(index)
+    def initialize_schedule(self):
+        ops = []
 
-        if self.operations[x][y] is None:
-            self.operations[x][y] = node
+        ops.append(self.add_timestep())
+        return ops
+
+    # Return true if the CGRA slots are free between
+    # start_tiem and end_time in location (x, y)
+    def slots_are_free(self, x, y, start_time, end_time):
+        for t in range(start_time, end_time):
+            # Add more timesteps to the schedule as required.
+            while t >= len(self.operations):
+                self.operations.append(self.add_timestep())
+
+            if self.operations[t][x][y] is not None:
+                return False
+        return True
+
+    # Return the earliest time after earliest time that we can
+    # fit an op of length 'length' in location x, y
+    def get_free_time(self, earliest_time, length, x, y):
+        while not self.slots_are_free(x, y, earliest_time, earliest_time + length):
+            earliest_time += 1
+        return earliest_time
+
+    def set_operation(self, time, x_loc, y_loc, node, latency):
+        while time + latency >= len(self.operations):
+            self.operations.append(self.add_timestep())
+
+        if self.slots_are_free(x_loc, y_loc, time, time + latency):
+            for t in range(time, time + latency):
+                self.operations[t][x_loc][y_loc] = node
             return True
         else:
             # Not set
             return False
 
-    def get_location(self, node):
+    def get_location(self, node: DFG.Node):
         # TODO -- make a hash table or something more efficient if required.
-        for x in range(self.cgra.x_dim):
-            for y in range(self.cgra.y_dim):
-                if self.operations[x][y].name == node.name:
-                    return x, y
-        return None, None
+        for t in range(len(self.operations)):
+            for x in range(self.cgra.x_dim):
+                for y in range(self.cgra.y_dim):
+                    if self.operations[t][x][y] is None:
+                        continue
+                    if self.operations[t][x][y].name == node.name:
+                        return t, x, y
+        return None, None, None
+
+    def free_times(self, x, y):
+        occupied_before = False
+        for t in range(len(self.operations)):
+            if self.operations[t][x][y] is not None:
+                occupied_before = True
+            else:
+                if occupied_before:
+                    # This was occupired at the last timestep t,
+                    # so it's become freed at this point.
+                    occupied_before = False
+                    yield t
+
+    def has_use(self, x, y):
+        for t in range(len(self.operations)):
+            if self.operations[t][x][y] is not None:
+                return True
+        return False
+
+    def alloc_times(self, x, y):
+        free_before = True
+        for t in range(len(self.operations)):
+            if self.operations[t][x][y] is not None:
+                # Was previously free.
+                if free_before:
+                    # Now was not free before.
+                    free_before = False
+                    yield t
+            else:
+                free_before = True
+
+class Schedule(object):
+    def __init__(self, cgra):
+        self.cgra = cgra
+
+        self.operations = InternalSchedule(cgra)
+
+    def set_operation(self, time, index, node, latency):
+        x, y = self.cgra.get_coords(index)
+        return self.operations.set_operation(time, x, y, node, latency)
+
+    def get_location(self, node):
+        return self.operations.get_location(node)
 
     def compute_communication_distance(self, n1, n2):
         # TODO -- thre is a lot that we should account
         # for.  Like not overloading particular routing
         # resources.
-        n1_x, n1_y = self.get_location(n1)
-        n2_x, n2_y = self.get_location(n2)
+        print("Looking at nodes", n1, n2)
+        n1_t, n1_x, n1_y = self.get_location(n1)
+        n2_t, n2_x, n2_y = self.get_location(n2)
 
         # TODO --- This needs to be adjusted to account for non-grid
         # CGRAs.
@@ -139,6 +224,11 @@ class Schedule(object):
 
     def get_II(self, dfg):
         # Compute the II of the current schedule.
+
+        # We don't require the placement part to be actually correct ---
+        # do the actual schedule what we generate can differ
+        # from the schedule we have internally.
+        actual_schedule = InternalSchedule(self.cgra)
 
         # What cycle does this node get executed on?
         cycles_start = {}
@@ -150,18 +240,35 @@ class Schedule(object):
         freed = {} # When we're done
         used = {} # When we start
 
+        # We keep track of whether scheduling is finished
+        # elsewhere --- this is just a sanity-check.
+        finished = True
+
         # Step 1 is to iterate over all the nodes
         # in a BFS manner.
         for node in dfg.bfs():
             # For each node, compute the latency,
             # and the delay to get the arguments to
             # reach it.
-            preds = dfg.getPreds(node)
+            preds = dfg.get_preds(node)
 
-            earliest_time = 0
+            # Get the time that this operation has
+            # been scheduled for.
+            scheduled_time, loc_x, loc_y = self.get_location(node)
+            earliest_time = scheduled_time
+
+            if scheduled_time is None:
+                finished = False
+                # This is not a complete operation
+                continue
+
             for pred in preds:
-                loc = self.get_location(node)
+                if pred.name not in cycles_end:
+                    finished = False
+                    continue
+
                 pred_cycle = cycles_end[pred.name]
+                print ("Have pred that finishes at cycle", pred_cycle)
 
                 # Compute the time to this node:
                 # TODO -- should we also account for not being
@@ -172,48 +279,56 @@ class Schedule(object):
                 arrival_time = distance + pred_cycle
                 earliest_time = max(earliest_time, arrival_time)
 
-            # Make sure that the PE is actually free.
-            if loc in freed:
-                earliest_time = max(earliest_time, max(freed[loc]))
+                # TODO --- compute a penalty based on the gap between
+                # operations to account for buffering.
+
+            # Check that the PE is actually free at this time --- if it
+            # isn't, push the operation back.
+            latency = operation_latency(node.operation)
+            free_time = actual_schedule.get_free_time(earliest_time, latency, loc_x, loc_y)
+            actual_schedule.set_operation(free_time, loc_x, loc_y, node, latency)
+            if free_time != earliest_time:
+                # We should probably punish the agent for this.
+                # Doesn't have any correctness issues as long as we
+                # assume infinite buffering (which we shouldn't do, and
+                # will eventually fix).
+                print("Place failed to place node in a sensible place: it is already in use!")
+
+            # TODO --- do we need to punish this more? (i.e. integrate
+            # buffering requirements?)
 
             # This node should run at the earliest time available.
-            cycles_start[node] = earliest_time
-            cycles_end[node] = earliest_time + operation_latency(node.operation)
+            cycles_start[node.name] = free_time
+            cycles_end[node.name] = free_time + operation_latency(node.operation)
 
-            # Keep track of when this PE can be used again.
-            if loc in freed:
-                freed[loc].append(cycles_end[node])
-                used[loc].append(cycles_start[node])
-            else:
-                freed[loc] = [cycles_end[node]]
-                used[loc] = [cycles_start[node]]
-
+            print ("Node ", node.name, "has earliest time", earliest_time)
 
         # Now that we've done that, we need to go through all the nodes and
         # work out the II.
         # When was this computation slot last used? (i.e. when could
         # we overlap the next iteration?)
-        last_freed = {}
-        first_used = {}
         min_II = 0
-        for loc in freed:
+        for x_loc, y_loc in actual_schedule.locations():
             # Now, we could achieve better performance
             # by overlapping these in a more fine-grained
             # manner --- but that seems like a lot of effort
             # for probably not much gain?
             # there ar probably loops where the gain
             # is not-so-marginal.
-            last_freed[loc] = max(freed[loc])
-            first_used[loc] = min(used[loc])
+            if actual_schedule.has_use(x_loc, y_loc):
+                # Can only do this for PEs that actually have uses!
+                last_free = max(actual_schedule.free_times(x_loc, y_loc))
+                first_alloc = min(actual_schedule.alloc_times(x_loc, y_loc))
 
-            difference = last_freed[loc] = first_used[loc]
-            min_II = max(min_II, difference)
+                difference = last_free - first_alloc
+                print ("Diff at loc", x_loc, y_loc, "is", difference)
+                min_II = max(min_II, difference)
 
         # TODO --- we should probably return some kind of object
         # that would enable final compilation also.
         return min_II
 
-compilation_session_cgra = CGRA(5, 5)
+compilation_session_cgra = CGRA(2, 2)
 
 action_space = [ActionSpace(name="Schedule",
             space=Space(
@@ -259,7 +374,12 @@ observation_space = [
             ObservationSpace(name="CurrentInstructionIndex",
                 space=Space(
                     int64_value=Int64Range(min=0, max=MAX_WINDOW_SIZE)
+                )),
+            ObservationSpace(name="II",
+                space=Space(
+                    int64_value=Int64Range(min=0)
                 ))
+
             # ObservationSpace(
             #     name="Schedule",
             #     space=Space(
@@ -278,9 +398,12 @@ class CGRACompilationSession(CompilationSession):
         logging.info("Starting a compilation session for CGRA" + str(self.cgra))
 
         # Load the DFG (from a test_dfg.json file):
-        self.dfg = DFG(working_directory, benchmark, from_json='test/test_dfg.json')
+        self.dfg = DFG.DFG(working_directory, benchmark, from_json='test/test_dfg.json')
 
         self.current_operation_index = 0
+        self.time = 0 # Starting schedulign time --- we could do
+        # this another way also, by asking the agent to come up with a raw
+        # time rather than stepping through.
         # TODO -- load this properly.
         self.dfg_to_ops_list()
 
@@ -289,7 +412,9 @@ class CGRACompilationSession(CompilationSession):
         # it contains two things: the name of the node, and the index
         # that corresponds to within the Operations list.
         self.ops = []
-        for op in self.dfg.nodes:
+        self.node_order = []
+        for n in self.dfg.nodes:
+            op = self.dfg.nodes[n]
             # Do we need to do a topo-sort here?
             if op.operation in Operations:
                 ind = Operations.index(op.operation)
@@ -298,6 +423,7 @@ class CGRACompilationSession(CompilationSession):
                 ind = 0
 
             self.ops.append(ind)
+            self.node_order.append(self.dfg.nodes[n])
 
     cgra = compilation_session_cgra
     schedule = Schedule(cgra)
@@ -319,12 +445,15 @@ class CGRACompilationSession(CompilationSession):
         if response > 0:
             # Schedule is set up to take the operation at the response index
             # index - 1.
-            op_set = self.schedule.set_operation(response - 1, self.ops[self.current_operation_index])
+            node = self.node_order[self.current_operation_index]
+            latency = operation_latency(node.operation)
+            op_set = self.schedule.set_operation(self.time, response - 1, node, latency)
 
             if op_set:
                 had_effect = True
                 self.current_operation_index += 1
-        # TODO --- Update the state.
+        elif response == 0:
+            self.time += 1
 
         done = False
         if self.current_operation_index >= len(self.ops):
@@ -354,3 +483,5 @@ class CGRACompilationSession(CompilationSession):
         elif observation_space.name == "CurrentInstructionIndex":
             # Return a way to localize the instruction within the graph.
             return Event(int64_value=self.current_operation_index)
+        elif observation_space.name == "II":
+            return Event(int64_value=self.schedule.get_II(self.dfg))

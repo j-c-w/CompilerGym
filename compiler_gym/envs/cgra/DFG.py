@@ -16,6 +16,9 @@ class Node(object):
         self.name = name
         self.operation = operation
 
+    def __str__(self):
+        return "Node with name " + self.name + " and op " + self.operation
+
 class DFG(object):
     def __init__(self, working_directory: Path, benchmark: Benchmark, from_json: Optional[Path] = None):
         # Copied from here: https://github.com/facebookresearch/CompilerGym/blob/development/examples/loop_optimizations_service/service_py/loops_opt_service.py
@@ -52,17 +55,50 @@ class DFG(object):
         with open(path, 'r') as p:
             f = json.load(p)
 
-            self.nodes = []
+            self.nodes = {}
             self.edges = []
             self.adj = {}
+            self.entry_points = f['entry_points']
 
             # build the nodes first.
             for node in f['nodes']:
-                self.nodes.append(Node(node['name'], node['operation']))
+                self.nodes[node['name']] = (Node(node['name'], node['operation']))
+                self.adj[node['name']] = []
 
             for edge in f['edges']:
                 self.edges.append(Edge(edge['type']))
 
             # Build the adj matrix:
             for edge in f['edges']:
-                self.adj[edge['from']] = edge['to']
+                fnode = edge['from']
+                tnode = edge['to']
+
+                self.adj[fnode].append(tnode)
+    
+    # Bit slow this one --- the adjacency matrix is backwards for it :'(
+    def get_preds(self, node):
+        preds = []
+        for n in self.adj:
+            if node.name in self.adj[n]:
+                preds.append(self.nodes[n])
+
+        return preds
+
+    # TODO -- fix this, because for a graph with multiple entry nodes,
+    # this doesn't actually give the right answer :)
+    # (should do in most cases)
+    def bfs(self):
+        to_explore = self.entry_points[:]
+        seen = set()
+
+        while len(to_explore) > 0:
+            head = to_explore[0]
+            to_explore = to_explore[1:]
+            if head in seen:
+                continue
+            seen.add(head)
+            yield self.nodes[head]
+
+            # Get the following nodes.
+            following_nodes = self.adj[head]
+            to_explore += following_nodes
