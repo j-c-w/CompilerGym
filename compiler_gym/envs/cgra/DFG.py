@@ -20,7 +20,7 @@ class Node(object):
         return "Node with name " + self.name + " and op " + self.operation
 
 class DFG(object):
-    def __init__(self, working_directory: Path, benchmark: Benchmark, from_json: Optional[Path] = None):
+    def __init__(self, working_directory: Path, benchmark: Benchmark, from_json: Optional[Path] = None, from_text: Optional[str] = None):
         # Copied from here: https://github.com/facebookresearch/CompilerGym/blob/development/examples/loop_optimizations_service/service_py/loops_opt_service.py
         # self.inst2vec = _INST2VEC_ENCODER
 
@@ -34,7 +34,11 @@ class DFG(object):
         self.src_path = str(self.working_directory / "benchmark.c")
         self.dfg_path = str(self.working_directory / "benchmark.dfg.json")
 
-        if from_json is None:
+        if from_json is not None:
+            self.load_dfg_from_json(from_json)
+        elif from_text is not None:
+            self.load_dfg_from_text(from_text)
+        else:
             # Only re-create the JSON file if we aren't providing an existing one.
             # The existing ones are mostly a debugging functionality.
             with open(self.working_directory / "benchmark.c", "wb") as f:
@@ -47,33 +51,36 @@ class DFG(object):
 
             # Now, load in the DFG.
             self.load_dfg_from_json(self.dfg_path)
-        else:
-            self.load_dfg_from_json(from_json)
 
     def load_dfg_from_json(self, path):
         import json
         with open(path, 'r') as p:
-            f = json.load(p)
+            # This isnt' text, but I think the json.loads
+            # that this calls just works?
+            self.load_dfg_from_text(p)
 
-            self.nodes = {}
-            self.edges = []
-            self.adj = {}
-            self.entry_points = f['entry_points']
+    def load_dfg_from_text(self, text):
+        import json
+        f = json.loads(text)
+        self.nodes = {}
+        self.edges = []
+        self.adj = {}
+        self.entry_points = f['entry_points']
 
-            # build the nodes first.
-            for node in f['nodes']:
-                self.nodes[node['name']] = (Node(node['name'], node['operation']))
-                self.adj[node['name']] = []
+        # build the nodes first.
+        for node in f['nodes']:
+            self.nodes[node['name']] = (Node(node['name'], node['operation']))
+            self.adj[node['name']] = []
 
-            for edge in f['edges']:
-                self.edges.append(Edge(edge['type']))
+        for edge in f['edges']:
+            self.edges.append(Edge(edge['type']))
 
-            # Build the adj matrix:
-            for edge in f['edges']:
-                fnode = edge['from']
-                tnode = edge['to']
+        # Build the adj matrix:
+        for edge in f['edges']:
+            fnode = edge['from']
+            tnode = edge['to']
 
-                self.adj[fnode].append(tnode)
+            self.adj[fnode].append(tnode)
     
     # Bit slow this one --- the adjacency matrix is backwards for it :'(
     def get_preds(self, node):

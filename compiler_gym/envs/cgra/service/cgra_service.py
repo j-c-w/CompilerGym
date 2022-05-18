@@ -2,6 +2,8 @@ import logging
 
 from typing import Optional, Tuple
 from pathlib import Path
+from compiler_gym.envs.llvm.llvm_rewards import CostFunctionReward
+from compiler_gym.service.client_service_compiler_env import ClientServiceCompilerEnv
 from compiler_gym.service import CompilationSession
 from compiler_gym.util.commands import run_command
 from compiler_gym.service.proto import (
@@ -19,7 +21,7 @@ StringSpace
 )
 import compiler_gym.third_party.llvm as llvm
 from compiler_gym.third_party.inst2vec import Inst2vecEncoder
-import DFG
+from compiler_gym.envs.cgra.DFG import DFG, Node, Edge
 
 from compiler_gym.service.proto.compiler_gym_service_pb2 import Int64SequenceSpace
 #from compiler_gym.service.runtime import create_and_run_compiler_gym_service
@@ -156,7 +158,7 @@ class InternalSchedule(object):
             # Not set
             return False
 
-    def get_location(self, node: DFG.Node):
+    def get_location(self, node: Node):
         # TODO -- make a hash table or something more efficient if required.
         for t in range(len(self.operations)):
             for x in range(self.cgra.x_dim):
@@ -391,14 +393,70 @@ observation_space = [
             # )
         ]
 
-class CGRACompilationSession(CompilationSession):
+class CGRASession(CompilationSession):
     def __init__(self, working_directory: Path, action_space: ActionSpace, benchmark: Benchmark):
         super().__init__(working_directory, action_space, benchmark)
         self.schedule = Schedule(self.cgra)
         logging.info("Starting a compilation session for CGRA" + str(self.cgra))
 
+        dfg_json = '''
+        {
+	"entry_points": ["n3", "n5"],
+	"nodes": [{
+		"operation": "add",
+		"name": "n1"
+	},
+	{"operation": "mul",
+	"name": "n2"},
+	{
+		"operation": "load",
+		"name": "n3"
+	},
+	{
+		"operation": "store",
+		"name": "n4"
+	},
+	{
+		"operation": "load",
+		"name": "n5"
+	}
+	],
+	"edges": [
+		{
+			"name": "e1",
+			"from": "n3",
+			"to": "n1",
+			"type": "data"
+		},
+		{
+			"name": "e2",
+			"from": "n5",
+			"to": "n1",
+			"type": "data"
+		},
+		{
+			"name": "e3",
+			"from": "n1",
+			"to": "n2",
+			"type": "data"
+		},
+		{
+			"name": "e4",
+			"from": "n3",
+			"to": "n2",
+			"type": "data"
+		},
+		{
+			"name": "e5",
+			"from": "n2",
+			"to": "n4",
+			"type": "data"
+		}
+	]
+}
+        '''
         # Load the DFG (from a test_dfg.json file):
-        self.dfg = DFG.DFG(working_directory, benchmark, from_json='test/test_dfg.json')
+        self.dfg = DFG(working_directory, benchmark, from_text=dfg_json)
 
         self.current_operation_index = 0
         self.time = 0 # Starting schedulign time --- we could do
@@ -485,3 +543,6 @@ class CGRACompilationSession(CompilationSession):
             return Event(int64_value=self.current_operation_index)
         elif observation_space.name == "II":
             return Event(int64_value=self.schedule.get_II(self.dfg))
+
+def make_cgra_compilation_session():
+    return CGRASession

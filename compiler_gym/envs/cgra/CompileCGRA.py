@@ -1,5 +1,5 @@
 #!/bin/env python3
-from CGRA import CGRACompilationSession, compilation_session_cgra
+from CGRA import CgraEnv, compilation_session_cgra
 import compiler_gym.service.runtime as runtime
 import logging
 logging.basicConfig(level=logging.DEBUG)
