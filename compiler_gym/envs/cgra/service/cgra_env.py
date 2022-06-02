@@ -16,16 +16,16 @@ from compiler_gym.spaces import Box, Commandline
 from compiler_gym.spaces import Dict as DictSpace
 from compiler_gym.spaces import Scalar, Sequence
 
-from compiler_gym.envs.cgra.cgra_rewards import RuntimeReward
+from compiler_gym.envs.cgra.cgra_rewards import IntermediateIIReward
 
 class CgraEnv(ClientServiceCompilerEnv):
     def __init__(self, *args, datasets_site_path: Optional[Path] = None, benchmark: Optional[Union[str, Benchmark]] = None, datasets_set_path: Optional[Path] = None, **kwargs):
         super().__init__(
             *args,
             **kwargs,
-            benchmark = benchmark or "cbench-v1/qsort",
+            benchmark = benchmark or "dfg_10/1",
             datasets=get_cgra_datasets(site_data_base=datasets_site_path),
-            rewards=[RuntimeReward()]
+            rewards=[IntermediateIIReward()]
             ,
             derived_observation_spaces=[
                 # {

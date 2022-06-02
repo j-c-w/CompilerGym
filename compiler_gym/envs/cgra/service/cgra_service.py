@@ -1,6 +1,8 @@
 import logging
+from re import I
+import pickle
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Set
 from pathlib import Path
 from compiler_gym.envs.llvm.llvm_rewards import CostFunctionReward
 from compiler_gym.service.client_service_compiler_env import ClientServiceCompilerEnv
@@ -21,83 +23,53 @@ StringSpace
 )
 import compiler_gym.third_party.llvm as llvm
 from compiler_gym.third_party.inst2vec import Inst2vecEncoder
-from compiler_gym.envs.cgra.DFG import DFG, Node, Edge
+from compiler_gym.envs.cgra.DFG import DFG, Node, Edge, generate_DFG
+from compiler_gym.envs.cgra.Operations import *
 
 from compiler_gym.service.proto.compiler_gym_service_pb2 import Int64SequenceSpace
 #from compiler_gym.service.runtime import create_and_run_compiler_gym_service
 
-Operations = [
-    # TODO --- should we support more operations as heterogeneous?
-    # IMO most of the other things that are scheduled are
-    # pretty vacuous, although we could explore supporting those.
-    "basic_operation", # Some operations, like phi, etc. can be treated
-    # as basic operations that any node could preform.
-    "add",
-    "mul",
-    "sub",
-    "div",
-    "and",
-    "or",
-    "xor",
-    "fmul",
-    "fsub",
-    "fadd",
-    "fdiv",
-    "rsh",
-    "lsh",
-    "load",
-    "store",
-    "noop"
-]
+CompileSettings = {
+    # When this is set, the scheduler will take schedules
+    # that don't account for delays appropriately, and try
+    # to stretch them out to account for delays correctly.
+    # When this is false, the compiler will just reject
+    # such invalid schedules.
+    # (when set, something like x + (y * z), scheduled
+    # as +: PE0 on cycle 0, *: PE1 on cycle 0 is valid).
+    "IntroduceRequiredDelays": False
+}
 
-def operation_latency(op):
-    # TODO --- model latency --- or at least expost this
-    # to a configuration.
-    return 1
+def load_CGRA(self, file):
+    # TODO -- properly load CGRA
+    return CGRA(5, 5)
 
+def load_NOC(self, file):
+    # TODO -- properly load NOC.
 
+    # Initialize to a straight-line NOC
+    return NOC([(x, x + 1) for x in range(5)])
 
 class CGRA(object):
     # Assume a rectangular matrix with neighbour
     # connections.  We can handle the rest later.
-    def __init__(self, x_dim, y_dim):
-        self.x_dim = x_dim
-        self.y_dim = y_dim
-
-        grid = []
-        # TODO -- load in the heterogeneous CGRA file.
+    def __init__(self, nodes, noc):
+        self.nodes = nodes
+        self.noc = noc
+        self.dim = len(self.nodes)
 
     def __str__(self):
-        return "CGRA: (" + (str(self.x_dim)) + ", " + (str(self.y_dim)) + ")"
+        return "CGRA: (" + (str(self.nodes)) + " nodes)"
 
     def is_supported(node_index, op):
         # TODO -- support heterogeneity
         return True
 
-    def get_coords(self, i):
-        x = i // self.y_dim
-        y = i % self.y_dim
-
-        return x, y
-
     def cells_as_list(self):
-        l = []
-        for i in range(self.x_dim):
-            for j in range(self.y_dim):
-                l.append(str(i * self.y_dim + j))
+        return self.nodes[:]
 
-        return l
-
-    def distance(self, index_1, index_2):
-        # Does this need to be SPP eventually?
-        x_1, y_1 = self.get_coords(index_1)
-        x_2, y_2 = self.get_coords(index_2)
-
-        return abs(x_1 - x_2) + abs(y_1 - y_2)
-
-    def delay(self, index_1, index_2):
-        # Assume one hop per cell right now.
-        return self.distance(index_1, index_2)
+    def get_neighbour(self, direction, location_from):
+        return self.noc.get_neighbour(direction, location_from)
 
 # This is just a wrapper around an actual object that
 # is a schedule --- see the Schedule object for something
@@ -107,18 +79,23 @@ class InternalSchedule(object):
         self.cgra = cgra
         self.operations = self.initialize_schedule()
 
+    def __str__(self):
+        res = "Schedule is \n"
+        for t in range(len(self.operations)):
+            res += "time " + str(t) + ": "
+            res += str([str(n) for n in self.operations[t]])
+            res += "\n"
+
+        return res
+
     def locations(self):
-        for x in range(self.cgra.x_dim):
-            for y in range(self.cgra.y_dim):
-                yield x, y
+        for x in range(self.cgra.dim + 1):
+            yield x
 
     def add_timestep(self):
         ops = []
-        for x in range(self.cgra.x_dim):
-            arr = []
-            for y in range(self.cgra.y_dim):
-                arr.append(None)
-            ops.append(arr)
+        for x in range(self.cgra.dim + 1):
+            ops.append(None)
         return ops
 
     def initialize_schedule(self):
@@ -127,52 +104,86 @@ class InternalSchedule(object):
         ops.append(self.add_timestep())
         return ops
 
+    def get_node(self, optime, oploc):
+        if optime < len(self.operations):
+            return self.operations[optime][oploc]
+        else:
+            return None
+
+    # See how long the thing scheduled at (T, X) lasts
+    # for --- note that if you pass in T + N, and the op
+    # started at T, you'll get true_latnecy - N.
+    def get_latency(self, optime, oploc):
+        op = self.get_node(optime, oploc)
+        old_op = op
+        t = optime
+
+        while op is not None and op == old_op:
+            t += 1
+            old_op = op
+            op = self.get_node(t, oploc)
+
+        return t - optime
+
     # Return true if the CGRA slots are free between
     # start_tiem and end_time in location (x, y)
-    def slots_are_free(self, x, y, start_time, end_time):
+    def slots_are_free(self, x, start_time, end_time):
         for t in range(start_time, end_time):
             # Add more timesteps to the schedule as required.
             while t >= len(self.operations):
                 self.operations.append(self.add_timestep())
 
-            if self.operations[t][x][y] is not None:
+            print ("Looking at time ", t, "op location", x)
+            print( "oplen is ", len(self.operations[t]))
+            if self.operations[t][x] is not None:
                 return False
         return True
 
     # Return the earliest time after earliest time that we can
     # fit an op of length 'length' in location x, y
-    def get_free_time(self, earliest_time, length, x, y):
-        while not self.slots_are_free(x, y, earliest_time, earliest_time + length):
+    def get_free_time(self, earliest_time, length, loc):
+        while not self.slots_are_free(loc, earliest_time, earliest_time + length):
             earliest_time += 1
         return earliest_time
 
-    def set_operation(self, time, x_loc, y_loc, node, latency):
+    def set_operation(self, time, loc, node, latency):
         while time + latency >= len(self.operations):
             self.operations.append(self.add_timestep())
 
-        if self.slots_are_free(x_loc, y_loc, time, time + latency):
+        if self.slots_are_free(loc, time, time + latency):
             for t in range(time, time + latency):
-                self.operations[t][x_loc][y_loc] = node
+                self.operations[t][loc] = node
             return True
         else:
             # Not set
             return False
 
+    # Blindly clear the operation from time to time + latency.
+    def clear_operation(self, time, loc, latency):
+        while time + latency >= len(self.operations):
+            self.operaitons.append(self.add_timestep())
+
+        cleared = False
+        for t in range(time, time + latency):
+            cleared = True
+            self.operations[t][loc] = None
+
+        assert cleared # sanity-check that we actually did something.
+
     def get_location(self, node: Node):
         # TODO -- make a hash table or something more efficient if required.
         for t in range(len(self.operations)):
-            for x in range(self.cgra.x_dim):
-                for y in range(self.cgra.y_dim):
-                    if self.operations[t][x][y] is None:
-                        continue
-                    if self.operations[t][x][y].name == node.name:
-                        return t, x, y
-        return None, None, None
+            for x in range(self.cgra.dim + 1):
+                if self.operations[t][x] is None:
+                    continue
+                if self.operations[t][x].name == node.name:
+                    return t, x
+        return None, None
 
-    def free_times(self, x, y):
+    def free_times(self, x):
         occupied_before = False
         for t in range(len(self.operations)):
-            if self.operations[t][x][y] is not None:
+            if self.operations[t][x] is not None:
                 occupied_before = True
             else:
                 if occupied_before:
@@ -181,16 +192,16 @@ class InternalSchedule(object):
                     occupied_before = False
                     yield t
 
-    def has_use(self, x, y):
+    def has_use(self, x):
         for t in range(len(self.operations)):
-            if self.operations[t][x][y] is not None:
+            if self.operations[t][x] is not None:
                 return True
         return False
 
-    def alloc_times(self, x, y):
+    def alloc_times(self, x):
         free_before = True
         for t in range(len(self.operations)):
-            if self.operations[t][x][y] is not None:
+            if self.operations[t][x] is not None:
                 # Was previously free.
                 if free_before:
                     # Now was not free before.
@@ -199,30 +210,185 @@ class InternalSchedule(object):
             else:
                 free_before = True
 
+class NOCSchedule(object):
+    def __init__(self):
+        self.schedule = []
+
+    def occupy_path(self, start_cycle, path):
+        for hop in path:
+            self.occupy_connection(start_cycle, hop)
+            start_cycle += 1
+
+    def occupy_connection(self, time, connection):
+        while time >= len(self.schedule):
+            self.schedule.append(set())
+
+        if connection in self.schedule[time]:
+            # Can't occuoy an already occupied connection.
+            assert False
+        else:
+            self.schedule[time].add(connection)
+
+    def is_occupied(self, time, hop):
+        if time >= len(self.schedule):
+            # Not occupied if beyond current suecule
+            return False
+        else:
+            return hop in self.schedule[time]
+
+# A class representing a NOC.
+class NOC(object):
+    def __init__(self, nodes, neighbours: Dict[str, List[str]]):
+        # A list of all the nodes.
+        self.nodes = nodes
+        # A directed list of one-hop connections between nodes.
+        self.neighbours = neighbours
+
+    # Returns the neighbour within a 3D space.  I don't really
+    # know how best to set this up in reality ---- espc if a node
+    # doesn't really have e.g. an 'up' neighbour, but only a 'up and left at
+    # the same time neighbour'.  The key constraint currently implemented
+    # here is that only six directions are supported (up, down, north, south, east
+    # west)
+    def get_neighbour(self, direction, location):
+        ns = self.neighbours[location]
+        index = None
+        # TODO --- we need a better way of storing these
+        # so it isn't implicit in the connection --- this implies
+        # that everything that has a 'south' connection must
+        # also have a north connection.
+        if direction == 'north':
+            index = 0
+        elif direction == 'south':
+            index = 1
+        elif direction == 'east':
+            index = 2
+        elif direction == 'west':
+            index = 3
+        elif direction == 'up':
+            index = 4
+        elif direction == 'down':
+            index = 5
+
+        if index is None:
+            print("Unknown index ", direction)
+            assert False
+
+        if index < len(ns):
+            print("Returning a node ", len(ns))
+            return ns[index]
+        else:
+            return None
+
+    # Work out the shortest path from from_n to to_n in
+    # the current NoC.
+    def shortest_path(self, from_n, to_n):
+        return self.shortest_available_path(0, from_n, to_n, None)
+
+    def shortest_available_path(self, start_time, from_n, to_n, schedule):
+        # So we should obviously do this better.
+        # Just a hack-y BFS search.
+        seen = set()
+        # Keep track of node and path so far.
+        # Invariant: this is sorted by shortest
+        # path.
+        to_see = [(from_n, [])]
+
+        while len(to_see) > 0:
+            n, path_to = to_see[0]
+            to_see = to_see[1:]
+            
+            if n == to_n:
+                # Found the path.  By invariant, this is the shortest
+                # path.
+                return path_to
+
+            nexts = self.neighbours[n]
+            for node in nexts:
+                if node in seen:
+                    pass
+                else:
+                    curr_time = start_time + len(path_to)
+                    if schedule is not None:
+                        if schedule.is_occupied(curr_time, (n, node)):
+                            # Can't use this as a path if it's currently
+                            # occupied.
+                            # TODO --- Add support for buffered delays.
+                            # continue
+                            if CompileSettings['IntroduceRequiredDelays']:
+                                continue
+                            else:
+                                return None
+                    # This is BFS, so everything must bewithin
+                    # one hop of the current search.  Therefore
+                    # this is the longest one, and can go at the back.
+                    to_see.append((node, path_to + [(n, node)]))
+        # No path between nodes.
+        return None
+
 class Schedule(object):
     def __init__(self, cgra):
         self.cgra = cgra
 
         self.operations = InternalSchedule(cgra)
 
+    def __str__(self):
+        return "CGRA:" + str(self.operations)
+
     def set_operation(self, time, index, node, latency):
-        x, y = self.cgra.get_coords(index)
-        return self.operations.set_operation(time, x, y, node, latency)
+        return self.operations.set_operation(time, index, node, latency)
+
+    def swap(self, origin_time, origin_index, target_time, target_index):
+        # This is a slightly non-trivial function since operations may have non-one
+        # latency.  We treat swap-points as the starting-points of the operation ---
+        # if the target point is in the middle of another operation, we choose to
+        # schedule this /at the start of the other operation/
+        
+        # First, we need to make sure that the whole target
+        # window is clear:
+        op_latency = self.operations.get_latency(origin_time, origin_index)
+        operation_node = self.operations.get_node(origin_time, origin_index)
+        # Check that the target window is clear:
+        # IF its' not clear, the easiest thing to do is a no-op.
+        assert target_time is not None
+        assert target_index is not None
+        assert operation_node is not None
+
+        target_window_is_clear = self.operations.set_operation(target_time, target_index, operation_node, operation_node.operation.latency)
+        # Now do the swap of operations
+        if target_window_is_clear:
+            print("Doing swap between ", origin_index, 'at', origin_time, 'to', target_index, 'at', target_time, 'with latency', op_latency)
+            self.operations.set_operation(target_time, target_index, operation_node, op_latency)
+            self.operations.clear_operation(origin_time, origin_index, op_latency)
+            return True
+        else:
+            return False
+
+
+    def clear_operation(self, time, index, latency):
+        self.operations.clear_operation(time, index, latency)
 
     def get_location(self, node):
         return self.operations.get_location(node)
 
-    def compute_communication_distance(self, n1, n2):
-        # TODO -- thre is a lot that we should account
-        # for.  Like not overloading particular routing
-        # resources.
-        print("Looking at nodes", n1, n2)
-        n1_t, n1_x, n1_y = self.get_location(n1)
-        n2_t, n2_x, n2_y = self.get_location(n2)
+    def compute_and_reserve_communication_distance(self, cycle, n1, n2, noc_schedule):
+        # Compute the shortest path:
+        n1_t, n1_loc = self.get_location(n1)
+        n2_t, n2_loc = self.get_location(n2)
 
-        # TODO --- This needs to be adjusted to account for non-grid
-        # CGRAs.
-        return abs(n2_x - n1_x) + abs(n2_y - n1_y)
+        # TODO -- a sanity-check that cycle is after this might be a good idea.
+        path = self.cgra.noc.shortest_available_path(cycle, n1_loc, n2_loc, noc_schedule)
+
+        if path is None:
+            # TODO --- we should probably punish the agent a lot here
+            # rather than crashing?
+            print("Schedule has not valid path")
+            return None
+        else:
+            noc_schedule.occupy_path(cycle, path)
+        
+        # I think we don't need the whole path?  Not too sure though.
+        return len(path)
 
     def get_II(self, dfg):
         # Compute the II of the current schedule.
@@ -231,6 +397,9 @@ class Schedule(object):
         # do the actual schedule what we generate can differ
         # from the schedule we have internally.
         actual_schedule = InternalSchedule(self.cgra)
+        noc_schedule = NOCSchedule() # The NOC schedule is recomputed
+        # every time because it is dependent on the actual
+        # schedule.
 
         # What cycle does this node get executed on?
         cycles_start = {}
@@ -256,7 +425,7 @@ class Schedule(object):
 
             # Get the time that this operation has
             # been scheduled for.
-            scheduled_time, loc_x, loc_y = self.get_location(node)
+            scheduled_time, loc = self.get_location(node)
             earliest_time = scheduled_time
 
             if scheduled_time is None:
@@ -264,6 +433,8 @@ class Schedule(object):
                 # This is not a complete operation
                 continue
 
+            print("Looking at node ", node)
+            print("Has preds ", [str(p) for p in preds])
             for pred in preds:
                 if pred.name not in cycles_end:
                     finished = False
@@ -272,10 +443,13 @@ class Schedule(object):
                 pred_cycle = cycles_end[pred.name]
                 print ("Have pred that finishes at cycle", pred_cycle)
 
-                # Compute the time to this node:
-                # TODO -- should we also account for not being
-                # able to use the NOC for multiple things at once?
-                distance = self.compute_communication_distance(pred, node)
+                # Compute the time to this node, and
+                # reserve those paths on the NoC.
+                distance = self.compute_and_reserve_communication_distance(pred_cycle, pred, node, noc_schedule)
+
+                if distance is None:
+                    # This schedule isn't possible due to conflicting memory requirements.
+                    return None, False
 
                 # Compute when this predecessor reaches this node:
                 arrival_time = distance + pred_cycle
@@ -287,8 +461,8 @@ class Schedule(object):
             # Check that the PE is actually free at this time --- if it
             # isn't, push the operation back.
             latency = operation_latency(node.operation)
-            free_time = actual_schedule.get_free_time(earliest_time, latency, loc_x, loc_y)
-            actual_schedule.set_operation(free_time, loc_x, loc_y, node, latency)
+            free_time = actual_schedule.get_free_time(earliest_time, latency, loc)
+            actual_schedule.set_operation(free_time, loc, node, latency)
             if free_time != earliest_time:
                 # We should probably punish the agent for this.
                 # Doesn't have any correctness issues as long as we
@@ -310,32 +484,41 @@ class Schedule(object):
         # When was this computation slot last used? (i.e. when could
         # we overlap the next iteration?)
         min_II = 0
-        for x_loc, y_loc in actual_schedule.locations():
+        for loc in actual_schedule.locations():
             # Now, we could achieve better performance
             # by overlapping these in a more fine-grained
             # manner --- but that seems like a lot of effort
             # for probably not much gain?
             # there ar probably loops where the gain
             # is not-so-marginal.
-            if actual_schedule.has_use(x_loc, y_loc):
+            if actual_schedule.has_use(loc):
                 # Can only do this for PEs that actually have uses!
-                last_free = max(actual_schedule.free_times(x_loc, y_loc))
-                first_alloc = min(actual_schedule.alloc_times(x_loc, y_loc))
+                last_free = max(actual_schedule.free_times(loc))
+                first_alloc = min(actual_schedule.alloc_times(loc))
 
                 difference = last_free - first_alloc
-                print ("Diff at loc", x_loc, y_loc, "is", difference)
+                print ("Diff at loc", loc, "is", difference)
                 min_II = max(min_II, difference)
 
         # TODO --- we should probably return some kind of object
         # that would enable final compilation also.
-        return min_II
+        return min_II, finished
 
-compilation_session_cgra = CGRA(2, 2)
+# Create a dummy CGRA that is a bunch of PEs in a row with neighbor-wise communciations
+nodes = [1, 2, 3, 4]
+neighbours_dict = {}
+for n in range(1, len(nodes)):
+    neighbours_dict[n] = [n + 1, n - 1]
+neighbours_dict[0] = [n + 1]
+neighbours_dict[len(nodes)] = [n - 1]
+
+compilation_session_noc = NOC(nodes, neighbours_dict)
+compilation_session_cgra = CGRA(nodes, compilation_session_noc)
 
 action_space = [ActionSpace(name="Schedule",
             space=Space(
                 named_discrete=NamedDiscreteSpace(
-                    name=compilation_session_cgra.cells_as_list()
+                    name=[str(x) for x in compilation_session_cgra.cells_as_list()]
                 )
                 # int64_box=Int64Box(
                 #     low=Int64Tensor(shape=[2], value=[0, 0]),
@@ -398,65 +581,8 @@ class CGRASession(CompilationSession):
         super().__init__(working_directory, action_space, benchmark)
         self.schedule = Schedule(self.cgra)
         logging.info("Starting a compilation session for CGRA" + str(self.cgra))
-
-        dfg_json = '''
-        {
-	"entry_points": ["n3", "n5"],
-	"nodes": [{
-		"operation": "add",
-		"name": "n1"
-	},
-	{"operation": "mul",
-	"name": "n2"},
-	{
-		"operation": "load",
-		"name": "n3"
-	},
-	{
-		"operation": "store",
-		"name": "n4"
-	},
-	{
-		"operation": "load",
-		"name": "n5"
-	}
-	],
-	"edges": [
-		{
-			"name": "e1",
-			"from": "n3",
-			"to": "n1",
-			"type": "data"
-		},
-		{
-			"name": "e2",
-			"from": "n5",
-			"to": "n1",
-			"type": "data"
-		},
-		{
-			"name": "e3",
-			"from": "n1",
-			"to": "n2",
-			"type": "data"
-		},
-		{
-			"name": "e4",
-			"from": "n3",
-			"to": "n2",
-			"type": "data"
-		},
-		{
-			"name": "e5",
-			"from": "n2",
-			"to": "n4",
-			"type": "data"
-		}
-	]
-}
-        '''
         # Load the DFG (from a test_dfg.json file):
-        self.dfg = DFG(working_directory, benchmark, from_text=dfg_json)
+        self.dfg = pickle.loads(benchmark.program.contents)
 
         self.current_operation_index = 0
         self.time = 0 # Starting schedulign time --- we could do
@@ -465,23 +591,26 @@ class CGRASession(CompilationSession):
         # TODO -- load this properly.
         self.dfg_to_ops_list()
 
+    def reset(self):
+        self.schedule = Schedule(self.cgra)
+        self.current_operation_index = 0
+        self.time = 0
+
     def dfg_to_ops_list(self):
         # Embed the DFG into an operations list that we go through ---
         # it contains two things: the name of the node, and the index
         # that corresponds to within the Operations list.
         self.ops = []
         self.node_order = []
-        for n in self.dfg.nodes:
-            op = self.dfg.nodes[n]
+        for op in self.dfg.bfs():
             # Do we need to do a topo-sort here?
-            if op.operation in Operations:
-                ind = Operations.index(op.operation)
-            else:
-                print("Did not find operation " + op.operation + " in the set of Operations")
-                ind = 0
+            ind = operation_index_of(op.operation)
+            if ind == -1:
+                print("Did not find operation " + str(op.operation) + " in the set of Operations")
+                assert False
 
             self.ops.append(ind)
-            self.node_order.append(self.dfg.nodes[n])
+            self.node_order.append(op)
 
     cgra = compilation_session_cgra
     schedule = Schedule(cgra)
@@ -496,6 +625,10 @@ class CGRASession(CompilationSession):
         print("Action is {}".format(str(action)))
 
         response = action.int64_value
+        if response == -1:
+            # Do a reset of the env:
+            self.reset()
+            return False, None, True
 
         # Update the CGRA to schedule the current operation at this space:
         # Take 0 to correspond to a no-op.
@@ -503,12 +636,33 @@ class CGRASession(CompilationSession):
         if response > 0:
             # Schedule is set up to take the operation at the response index
             # index - 1.
+            if self.current_operation_index >= len(self.node_order):
+                # We've scheduled past the end!
+                return False, None, False
+
             node = self.node_order[self.current_operation_index]
             latency = operation_latency(node.operation)
             op_set = self.schedule.set_operation(self.time, response - 1, node, latency)
 
+            # Check that the II still exists:
+            II, finished = self.schedule.get_II(self.dfg)
+            has_II = II is not None
+            if not has_II:
+                # Unset that operation:
+                print("Setting operation resulted in failed DFG mapping")
+                print(self.schedule)
+                self.schedule.clear_operation(self.time, response - 1, latency)
+                print("After clearning, have")
+                print(self.schedule)
+                op_set = False # Need to punish.
+                new_II, _ = self.schedule.get_II(self.dfg)
+                assert (new_II is not None) # This should not
+                # be non-existent after un-scheduling.
+
             if op_set:
                 had_effect = True
+                print("Scheduled operation", str(self.node_order[self.current_operation_index]))
+                print("Got an II of ", II)
                 self.current_operation_index += 1
         elif response == 0:
             self.time += 1
@@ -516,6 +670,11 @@ class CGRASession(CompilationSession):
         done = False
         if self.current_operation_index >= len(self.ops):
             done = True
+
+        print("At end of cycle, have schedule")
+        print(self.schedule)
+        print("Done is ", done)
+
         return done, None, had_effect
 
     def get_observation(self, observation_space: ObservationSpace) -> Event:
@@ -542,7 +701,12 @@ class CGRASession(CompilationSession):
             # Return a way to localize the instruction within the graph.
             return Event(int64_value=self.current_operation_index)
         elif observation_space.name == "II":
-            return Event(int64_value=self.schedule.get_II(self.dfg))
+            print("Computing II for schedule:")
+            print(self.schedule)
+            ii, finished = self.schedule.get_II(self.dfg)
+            print("Got II", ii)
+            print ("Finished is ", finished)
+            return Event(int64_value=ii)
 
 def make_cgra_compilation_session():
     return CGRASession

@@ -10,4 +10,5 @@ cg_filegroup(
   FILES
     "${CMAKE_CURRENT_LIST_DIR}/cgra_service.py"
     "${CMAKE_CURRENT_LIST_DIR}/compiler_gym-cgra-service"
+    "${CMAKE_CURRENT_LIST_DIR}/compiler_gym-cgra-relative-placement-service"
 )

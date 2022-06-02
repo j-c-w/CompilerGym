@@ -7,16 +7,19 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Union
 
 from compiler_gym.datasets import Dataset
-from compiler_gym.envs.cgra.datasets.cbench import CBenchDataset
+from compiler_gym.envs.cgra.datasets.dfg_bench import GeneratedDFGs, GeneratedDFGs10, GeneratedDFGs15, GeneratedDFGs20, GeneratedDFGs5
 from compiler_gym.util.runfiles_path import site_data_path
 
 
 def _get_cgra_datasets(
     site_data_base: Optional[Path] = None
 ) -> Iterable[Dataset]:
-    site_data_base = site_data_base or site_data_path("gcc-v0")
+    site_data_base = site_data_base or site_data_path("cgra-v0")
 
-    yield CBenchDataset(site_data_base=site_data_base)
+    yield GeneratedDFGs5(site_data_base=site_data_base)
+    yield GeneratedDFGs10(site_data_base=site_data_base)
+    yield GeneratedDFGs15(site_data_base=site_data_base)
+    yield GeneratedDFGs20(site_data_base=site_data_base)
 
 
 @lru_cache(maxsize=16)
@@ -34,6 +37,9 @@ def get_cgra_datasets(
 
 
 __all__ = [
-    "CBenchDataset"
+    "GeneratedDFGs5",
+    "GeneratedDFGs10",
+    "GeneratedDFGs15",
+    "GeneratedDFGs20",
     "get_cgra_datasets",
 ]

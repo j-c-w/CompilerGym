@@ -9,6 +9,7 @@ py_library(
     srcs = [
         "__init__.py",
         "cgra_rewards.py",
+        "Operations.py",
         "DFG.py"
     ],
     data = [
