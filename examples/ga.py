@@ -47,6 +47,11 @@ print("Initialized Counters")
 
 if __name__ == "__main__":
     flags.DEFINE_boolean(
+        "variable_length_sequences",
+        False,
+        "Use a crossover algorithm that supports generation of variable length sequences"
+    )
+    flags.DEFINE_boolean(
         "print_counters",
         False,
         "Print Internal Compile Conters"
@@ -90,6 +95,11 @@ if __name__ == "__main__":
         "refill",
         False,
         "refill the candidates list using randomly generated candidates if it is too small after each generation"
+    )
+    flags.DEFINE_integer(
+        "expected_candidates",
+        1000,
+        "How many candidates to take during crossover (in expectation) (only for fixed length --- see reduction factor for variable length)"
     )
     FLAGS = flags.FLAGS
 
@@ -156,7 +166,28 @@ def mutate(cands: Set[List[ActionType]]):
 
     return new_set
 
-def crossover(cands: Set[List[ActionType]]):
+# This is a much simpler method that produces a much smaller set for
+# fixed-lenght sequences.  The crossover_variable_length method
+# has a tendency to explode under long action sequences.
+def crossover_fixed_length(cands: Set[List[ActionType]]):
+    new_cands = set()
+    for c in cands:
+        cand_count = len(c.actions) * len(cands) * len(cands)
+        fraction_taken = float(FLAGS.expected_candidates) / float(cand_count)
+
+        for c2 in cands:
+            for i in range(len(c.actions)):
+                should_add = random.random() < fraction_taken
+                if not should_add:
+                    continue
+
+                new_cand = Candidate(c.actions[:i] + c2.actions[i:])
+                new_cands.add(new_cand)
+
+    print("Generated ", len(new_cands), "candidates")
+    return new_cands
+
+def crossover_variable_length(cands: Set[List[ActionType]]):
     # Is there a better way to do this?
     # For the CGRA env, these are not fixed length.
 
@@ -211,7 +242,8 @@ def compute_individual_fitness(inps):
     cand.compute_score(env, FLAGS.reward)
     return cand
 
-def compute_set_fitness(cands, env):
+def compute_set_fitness(inps):
+    cands, env = inps
     env.reset()
     for c in cands:
         compute_individual_fitness((c, env))
@@ -243,16 +275,31 @@ def compute_fitness(cands, benchmark):
         envs = []
         for inp_set in inputs:
             envs.append((inp_set, env_from_flags(benchmark=benchmark)))
+            print("Length of input set is", len(inp_set))
 
-        with multiprocessing.Pool(num_proc) as p:
-            # The 'cand' things are mutable --- and are
-            # changed internally.
-            results = p.map(compute_set_fitness, envs)
+        procs = []
+        for i in range(num_proc + 1):
+            print("Getting ready to start proc ", i)
+            item = envs[i]
+            p1 = multiprocessing.Process(target=compute_set_fitness, args=(item,))
+            print("Created proc ", i)
+            print("It operates on ", item)
+            p1.start()
+            print("started proc ", i)
+            procs.append(p1)
+            print("Started proc", i, "out of", num_proc, len(envs))
+        
+        i = 0
+        for p in procs:
+            print("Joining ", i)
+            i += 1
+            p.join()
+            print("Joined")
 
-        cands = [] # Need to deal with some locks?
-        for r in results:
-            for elem in r:
-                cands.append(elem)
+        # cands = [] # Need to deal with some locks?
+        # for r in results:
+        #     for elem in r:
+        #         cands.append(elem)
     else:
         with env_from_flags(benchmark=benchmark) as env:
             env.reset()
@@ -276,7 +323,10 @@ def run_ga(benchmark: benchmark.Benchmark, step_count: int, initial_candidates: 
 
         print ("Starting iteration", iter_number, "with", len(current_candidates), "candidates")
         mutations = mutate(current_candidates.copy())
-        crossed = crossover(mutations)
+        if FLAGS.variable_length_sequences:
+            crossed = crossover_variable_length(mutations)
+        else:
+            crossed = crossover_fixed_length(mutations)
         fitness = compute_fitness(crossed, benchmark)
         print ("Iter: " + str(iter_number) + " with generation size " + str(len(fitness)))
 
