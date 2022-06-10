@@ -10,7 +10,6 @@ TODO -- Support environments that don't do that.
 
 import random
 import math
-import multiprocessing
 
 import humanize
 from random_walk import run_random_walk
@@ -55,11 +54,6 @@ if __name__ == "__main__":
         "print_counters",
         False,
         "Print Internal Compile Conters"
-    )
-    flags.DEFINE_boolean(
-        "mp",
-        True,
-        "use MP"
     )
     flags.DEFINE_integer(
         "iters",
@@ -263,48 +257,10 @@ def split_array(a, n):
     return new_arrs
     
 def compute_fitness(cands, benchmark):
-    if FLAGS.mp:
-        num_proc = multiprocessing.cpu_count()
-        # If the batch sizes are too small, it's not
-        # worth distributing --- YMMV for heavy
-        # agents.
-        num_proc = min(num_proc, len(cands) // 50)
-        # Split the tasks to do into n_proc lists.
-        inputs = split_array(cands, num_proc)
-        # Create one ENV for each core.
-        envs = []
-        for inp_set in inputs:
-            envs.append((inp_set, env_from_flags(benchmark=benchmark)))
-            print("Length of input set is", len(inp_set))
-
-        procs = []
-        for i in range(num_proc + 1):
-            print("Getting ready to start proc ", i)
-            item = envs[i]
-            p1 = multiprocessing.Process(target=compute_set_fitness, args=(item,))
-            print("Created proc ", i)
-            print("It operates on ", item)
-            p1.start()
-            print("started proc ", i)
-            procs.append(p1)
-            print("Started proc", i, "out of", num_proc, len(envs))
-        
-        i = 0
-        for p in procs:
-            print("Joining ", i)
-            i += 1
-            p.join()
-            print("Joined")
-
-        # cands = [] # Need to deal with some locks?
-        # for r in results:
-        #     for elem in r:
-        #         cands.append(elem)
-    else:
-        with env_from_flags(benchmark=benchmark) as env:
-            env.reset()
-            for cand in cands:
-                compute_individual_fitness((cand, env))
+    with env_from_flags(benchmark=benchmark) as env:
+        env.reset()
+        for cand in cands:
+            compute_individual_fitness((cand, env))
 
     return cands
     
@@ -366,7 +322,7 @@ def main(argv):
             for action in elt.actions:
                 env.step(action)
             
-            print ("Result env was", env)
+            print ("Result env was", env, "best score was", best_score)
 
     if FLAGS.print_counters:
         for field in ga_stats:
