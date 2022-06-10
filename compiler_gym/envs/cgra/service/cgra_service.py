@@ -2,10 +2,13 @@ import logging
 from re import I
 import pickle
 
-from typing import Optional, Tuple, List, Dict, Set
+from typing import Optional, Tuple, List, Dict, Set, Union
 from pathlib import Path
+from compiler_gym.views import ObservationSpaceSpec
+from compiler_gym.spaces import Reward
 from compiler_gym.envs.llvm.llvm_rewards import CostFunctionReward
 from compiler_gym.service.client_service_compiler_env import ClientServiceCompilerEnv
+from compiler_gym.util.gym_type_hints import ObservationType, OptionalArgumentValue
 from compiler_gym.service import CompilationSession
 from compiler_gym.util.commands import run_command
 from compiler_gym.service.proto import (
@@ -75,9 +78,56 @@ class CGRA(object):
 # is a schedule --- see the Schedule object for something
 # that can be interacted with.
 class InternalSchedule(object):
-    def __init__(self, cgra):
+    def __init__(self, cgra, dfg):
+        self.dfg = dfg # For tensorization.
         self.cgra = cgra
         self.operations = self.initialize_schedule()
+
+    # Returns a fixed-length tensor for this schedule.
+    # It focuses on the last few cycles.
+    def to_rlmap_tensor(self, node, time_window_size=1):
+        # Build up a tensor of timesxcgra.dimxcgra.dim as per
+        # RLMap paper.
+        # Note that they don't use a times dimension, as their
+        # PEs are fixed within a single schedule.
+        # We want to fcous the results ardoung the operation
+        # that we are looking at.
+        time_window, _ = self.get_location(node)
+        # Aim is to be symmetric around the central time window.
+        start_time = time_window - (time_window_size // 2)
+        end_time = time_window + ((time_window_size - 1) // 2)
+
+        result_tensor = []
+        for t in range(start_time, end_time + 1):
+            if t < 0:
+                # If this is a time before the start of the schedule, just
+                # add some zeroes.
+                result_tensor += ([0] * ((self.cgra.dim + 1) * (self.cgra.dim + 1)))
+                continue
+            if t >= len(self.operations):
+                # Likewise if we are past the end fo the current schedule
+                result_tensor += ([0] * ((self.cgra.dim + 1) * (self.cgra.dim + 1)))
+                continue
+
+            for loc in range(self.cgra.dim + 1):
+                elem = self.operations[t][loc]
+                if elem is None:
+                    result_tensor += [0] * (self.cgra.dim + 1)
+                else:
+                    # Get preds and succs from this node:
+                    pred_nodes = self.dfg.get_preds(elem)
+                    succ_nodes = self.dfg.get_succs(elem)
+                    state_vector = [0] * (self.cgra.dim + 1)
+
+                    for l in pred_nodes:
+                        time, loc = self.get_location(l)
+                        state_vector[loc] = 1
+                    for l in succ_nodes:
+                        time, loc = self.get_location(l)
+                        state_vector[loc] = 2
+                    result_tensor += state_vector
+
+        return result_tensor
 
     def __str__(self):
         res = "Schedule is \n"
@@ -327,16 +377,25 @@ class NOC(object):
         return None
 
 class Schedule(object):
-    def __init__(self, cgra):
+    def __init__(self, cgra, dfg):
+        # Note that we don't store the DFG because this actually
+        # creates the schedule, but so that this can be tensorized.
+        self.dfg = dfg
         self.cgra = cgra
 
-        self.operations = InternalSchedule(cgra)
+        self.operations = InternalSchedule(cgra, self.dfg)
 
     def __str__(self):
         return "CGRA:" + str(self.operations)
 
     def set_operation(self, time, index, node, latency):
         return self.operations.set_operation(time, index, node, latency)
+
+    def to_rlmap_tensor(self, node, time_window_size=1):
+        # Get the RLMap Tensor --- note that it is node dependent
+        # as this is a compiler that can support time-multiplexing
+        # of operations on nodes.
+        return self.operations.to_rlmap_tensor(node, time_window_size=time_window_size)
 
     def swap(self, origin_time, origin_index, target_time, target_index):
         # This is a slightly non-trivial function since operations may have non-one
@@ -382,7 +441,7 @@ class Schedule(object):
         if path is None:
             # TODO --- we should probably punish the agent a lot here
             # rather than crashing?
-            print("Schedule has not valid path")
+            print("Schedule has not valid path between ", n1_loc, "and", n2_loc, "at time", cycle)
             return None
         else:
             noc_schedule.occupy_path(cycle, path)
@@ -396,7 +455,7 @@ class Schedule(object):
         # We don't require the placement part to be actually correct ---
         # do the actual schedule what we generate can differ
         # from the schedule we have internally.
-        actual_schedule = InternalSchedule(self.cgra)
+        actual_schedule = InternalSchedule(self.cgra, dfg)
         noc_schedule = NOCSchedule() # The NOC schedule is recomputed
         # every time because it is dependent on the actual
         # schedule.
@@ -530,6 +589,13 @@ action_space = [ActionSpace(name="Schedule",
 
 MAX_WINDOW_SIZE = 100
 
+# This is here rather than in the RP environment because
+# it's needed to define the observation space.
+rlmap_time_depth = 20
+# Have an entry for each cell in the compilation_session CGRA and also
+# a note of the current operation
+rlmap_tensor_size = ((compilation_session_cgra.dim + 1) * (compilation_session_cgra.dim + 1)) * rlmap_time_depth + 1
+relative_placement_directions = ["no_action", "up", "down", "north", "south", "east", "west", "sooner", "later"]
 observation_space = [
             # ObservationSpace(
             #     name="dfg",
@@ -563,7 +629,15 @@ observation_space = [
             ObservationSpace(name="II",
                 space=Space(
                     int64_value=Int64Range(min=0)
-                ))
+                )),
+            ObservationSpace(name="RLMapObservations",
+                space=Space(
+                    int64_box=Int64Box(
+                        low=Int64Tensor(shape=[rlmap_tensor_size], value=([0] * rlmap_tensor_size)),
+                        high=Int64Tensor(shape=[rlmap_tensor_size], value=([100000] * rlmap_tensor_size))
+                    )
+                )
+            )
 
             # ObservationSpace(
             #     name="Schedule",
@@ -579,10 +653,10 @@ observation_space = [
 class CGRASession(CompilationSession):
     def __init__(self, working_directory: Path, action_space: ActionSpace, benchmark: Benchmark):
         super().__init__(working_directory, action_space, benchmark)
-        self.schedule = Schedule(self.cgra)
         logging.info("Starting a compilation session for CGRA" + str(self.cgra))
         # Load the DFG (from a test_dfg.json file):
         self.dfg = pickle.loads(benchmark.program.contents)
+        self.schedule = Schedule(self.cgra, self.dfg)
 
         self.current_operation_index = 0
         self.time = 0 # Starting schedulign time --- we could do
@@ -591,10 +665,25 @@ class CGRASession(CompilationSession):
         # TODO -- load this properly.
         self.dfg_to_ops_list()
 
-    def reset(self):
-        self.schedule = Schedule(self.cgra)
+    def reset(self,
+        benchmark: Optional[Union[str, Benchmark]] = None,
+        action_space: Optional[str] = None,
+        observation_space: Union[
+            OptionalArgumentValue, str, ObservationSpaceSpec
+        ] = OptionalArgumentValue.UNCHANGED,
+        reward_space: Union[
+            OptionalArgumentValue, str, Reward
+        ] = OptionalArgumentValue.UNCHANGED,
+    ):
+        print("Reset started")
+        if benchmark is not None:
+            self.dfg = pickle.loads(benchmark.program.contents)
+        else:
+            self.dfg = None
+        self.schedule = Schedule(self.cgra, self.dfg)
         self.current_operation_index = 0
         self.time = 0
+        print("Reset complete")
 
     def dfg_to_ops_list(self):
         # Embed the DFG into an operations list that we go through ---
@@ -613,8 +702,6 @@ class CGRASession(CompilationSession):
             self.node_order.append(op)
 
     cgra = compilation_session_cgra
-    schedule = Schedule(cgra)
-
     action_spaces = action_space
 
     observation_spaces = observation_space
@@ -707,6 +794,21 @@ class CGRASession(CompilationSession):
             print("Got II", ii)
             print ("Finished is ", finished)
             return Event(int64_value=ii)
+        elif observation_space.name == "RLMapObservations":
+            print("Getting RLMap Observations")
+            print("Observation space is " + str(type(observation_space)))
+            current_operation_index = self.current_operation_index
+            node = self.node_order[current_operation_index]
+            # TODO --- add encoding of the CGRA constraints (not required for faithful
+            # reimplementation of RLMap, but probably required for a fair comparison.)
+            schedule_encoding = self.schedule.to_rlmap_tensor(node, time_window_size=rlmap_time_depth)
+
+            full_res = [current_operation_index] + schedule_encoding
+            if len(full_res) != rlmap_tensor_size:
+                print("Tensor sizes don't match!", len(full_res), ' and ', rlmap_tensor_size)
+                assert False
+
+            return Event(int64_tensor=Int64Tensor(shape=[len(full_res)], value=full_res))
 
 def make_cgra_compilation_session():
     return CGRASession

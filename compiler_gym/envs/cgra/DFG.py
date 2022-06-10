@@ -91,6 +91,12 @@ class DFG(object):
 
         return preds
 
+    def get_succs(self, node):
+        succs = []
+        for n in self.adj[node.name]:
+            succs.append(self.nodes[n])
+        return succs
+
     # TODO -- fix this, because for a graph with multiple entry nodes,
     # this doesn't actually give the right answer :)
     # (should do in most cases)
