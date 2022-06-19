@@ -122,6 +122,7 @@ setup_kwargs = {
         "compiler_gym.envs.gcc.datasets",
         "compiler_gym.envs.gcc.service",
         "compiler_gym.envs.gcc",
+        "compiler_gym.envs.cgra.architectures",
         "compiler_gym.envs.cgra.datasets",
         "compiler_gym.envs.cgra.service",
         "compiler_gym.envs.cgra",

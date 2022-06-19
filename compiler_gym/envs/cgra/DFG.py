@@ -97,6 +97,12 @@ class DFG(object):
             succs.append(self.nodes[n])
         return succs
 
+    def build_preds_lookup(self):
+        preds_lookup = {}
+        for n in self.node_names:
+            preds_lookup[n] = self.get_preds(self.nodes[n])
+        return preds_lookup
+
     # TODO -- fix this, because for a graph with multiple entry nodes,
     # this doesn't actually give the right answer :)
     # (should do in most cases)
@@ -106,6 +112,10 @@ class DFG(object):
         print(self.entry_points)
         seen = set()
 
+        # build a lookup based on the predecessors
+        # for each node.
+        preds_lookup = self.build_preds_lookup()
+
         while len(to_explore) > 0:
             head = to_explore[0]
             to_explore = to_explore[1:]
@@ -114,9 +124,30 @@ class DFG(object):
             seen.add(head)
             yield self.nodes[head]
 
-            # Get the following nodes.
-            following_nodes = self.adj[head]
-            to_explore += following_nodes
+            # Add the next batch of nodes that we have
+            # visited all the preds for if there are more
+            # nodes to explore.
+            if len(to_explore) == 0 and len(seen) != len(self.node_names):
+                for node_name in self.node_names:
+                    if node_name in seen:
+                        continue
+                    else:
+                        # Unseen --- have we seen all th preds?
+                        failed = False
+                        for p in preds_lookup[node_name]:
+                            if p.name not in seen:
+                                failed = True
+                        if not failed:
+                            to_explore.append(node_name)
+                if len(to_explore) == 0: # We added nothing despite trying
+                    # to.
+
+                    # TODO -- Fix this, as support for cyclical DFGs
+                    # is important to be able to support loops with 
+                    # cross-loop dependencies.
+                    print("Cyclical DFG --- Impossible to do a true BFS")
+                    print("DFG is ", str(self))
+                    assert False
 
 # Generate a test DFG using the operations in
 # 'operations'.

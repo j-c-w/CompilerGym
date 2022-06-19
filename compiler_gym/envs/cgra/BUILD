@@ -10,6 +10,7 @@ py_library(
         "__init__.py",
         "cgra_rewards.py",
         "Operations.py",
+        "compile_settings.py",
         "DFG.py"
     ],
     data = [
@@ -18,6 +19,7 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         "//compiler_gym/envs/cgra/datasets",
+        "//compiler_gym/envs/cgra/architectures",
         "//compiler_gym/errors",
         "//compiler_gym/service:client_service_compiler_env",
         "//compiler_gym/service/runtime",  # Implicit dependency of service.
